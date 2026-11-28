@@ -1,0 +1,114 @@
+name: Build and publish Mac game
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Windows version, or leave blank to use the latest eligible release
+        required: false
+        type: string
+  schedule:
+    - cron: '23 * * * *'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mac-release.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-mac-game
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.event_name != 'release' || (startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease)
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Verify and unpack Mac builder
+        run: |
+          printf '%s  %s\n' 53437351fe6dd627e583aa71e0b86e4589899b3ae4b28fae97ec1bc79fd48e92 SealOffline-Mac-CI-Builder.zip | shasum -a 256 -c -
+          unzip -q -o SealOffline-Mac-CI-Builder.zip
+      - name: Resolve Windows source
+        id: source
+        env:
+          REQUESTED: ${{ inputs.version }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test "$(uname -m)" = arm64
+          v="${REQUESTED:-${EVENT_TAG#v}}"
+          if [[ -z "$v" ]]; then
+            v="$(bash mac-builder/Build-from-GitHub.command --latest-version)"
+          fi
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == release ]]; then exit 0; fi
+            echo 'Expected a three-part version, such as 0.2.9.' >&2
+            exit 1
+          fi
+          tag="mac-v$v"
+          asset="SealOffline-Origins-Mac-V$v.dmg"
+          statuses="$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq             ".[] | select(.tag_name == \"$tag\") | if .draft then \"draft\" elif .prerelease then \"prerelease\" elif any(.assets[]; .name == \"$asset\" and .state == \"uploaded\" and ((.digest // \"\") | test(\"^sha256:[a-f0-9]{64}$\"))) then \"ready\" else \"incomplete\" end")"
+          case "$statuses" in
+            ready) echo "$tag is already published with a verified download."; exit 0 ;;
+            '') ;;
+            *) echo "$tag already exists with status $statuses. Review the existing release before retrying." >&2; exit 1 ;;
+          esac
+          printf 'version=%s\nasset=%s\n' "$v" "$asset" >> "$GITHUB_OUTPUT"
+      - name: Verify Windows ZIP and build Apple Silicon DMG
+        if: steps.source.outputs.version != ''
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          mkdir -p dist
+          bash mac-builder/Build-from-GitHub.command "$VERSION" --output-dir "$PWD/dist"
+      - name: Verify packaged version, architecture and signature
+        if: steps.source.outputs.version != ''
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+          ASSET: ${{ steps.source.outputs.asset }}
+        run: |
+          mount="$(mktemp -d)"
+          trap 'if hdiutil detach "$mount"; then rmdir "$mount"; fi' EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "dist/$ASSET"
+          app="$mount/SealOffline.app"
+          codesign --verify --strict --verbose=2 "$app"
+          test "$(lipo -archs "$app/Contents/MacOS/SealOffline")" = arm64
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
+          test -f "$app/Contents/Resources/game/east-island-native-preview.mjs"
+          shasum -a 256 "dist/$ASSET"
+      - name: Publish and verify Mac update
+        if: steps.source.outputs.version != ''
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+          ASSET: ${{ steps.source.outputs.asset }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="mac-v$VERSION"
+          notes="$(mktemp)"
+          {
+            printf 'Apple Silicon Mac 遊戲 V%s。已有 Mac 登入器的玩家可按「檢查更新」，再選「更新至 V%s」。\n\n' "$VERSION" "$VERSION"
+            printf '使用無網址列的獨立遊戲視窗。更新內容請參考 [V%s 遊戲發行說明](https://github.com/%s/releases/tag/v%s)。\n' "$VERSION" "$GH_REPO" "$VERSION"
+          } > "$notes"
+          gh release create "$tag" "dist/$ASSET" --target "$(git rev-parse HEAD)" --latest=false --title "Mac V$VERSION" --notes-file "$notes"
+          expected="$(shasum -a 256 "dist/$ASSET" | cut -d ' ' -f 1)"
+          for try in 1 2 3; do
+            if actual="$(gh api "repos/$GH_REPO/releases/tags/$tag" --jq               "select(.draft == false and .prerelease == false) | .assets[] | select(.name == \"$ASSET\" and .state == \"uploaded\") | .digest")" && [[ "$actual" == "sha256:$expected" ]]; then
+              printf 'Published and verified %s (%s)\n' "$tag" "$actual"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Published release digest did not match the local DMG.' >&2
+          exit 1
