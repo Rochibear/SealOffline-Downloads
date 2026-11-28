@@ -9,6 +9,11 @@ on:
         description: Windows version, or leave blank to use the latest eligible release
         required: false
         type: string
+      publish:
+        description: Publish to GitHub Releases after verification
+        required: false
+        type: boolean
+        default: true
   schedule:
     - cron: '23 * * * *'
   push:
@@ -31,6 +36,7 @@ jobs:
       contents: write
     env:
       GH_REPO: ${{ github.repository }}
+      PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -59,12 +65,14 @@ jobs:
           fi
           tag="mac-v$v"
           asset="SealOffline-Origins-Mac-V$v.dmg"
-          statuses="$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq             ".[] | select(.tag_name == \"$tag\") | if .draft then \"draft\" elif .prerelease then \"prerelease\" elif any(.assets[]; .name == \"$asset\" and .state == \"uploaded\" and ((.digest // \"\") | test(\"^sha256:[a-f0-9]{64}$\"))) then \"ready\" else \"incomplete\" end")"
-          case "$statuses" in
-            ready) echo "$tag is already published with a verified download."; exit 0 ;;
-            '') ;;
-            *) echo "$tag already exists with status $statuses. Review the existing release before retrying." >&2; exit 1 ;;
-          esac
+          if [[ "$PUBLISH" == true ]]; then
+            statuses="$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq             ".[] | select(.tag_name == \"$tag\") | if .draft then \"draft\" elif .prerelease then \"prerelease\" elif any(.assets[]; .name == \"$asset\" and .state == \"uploaded\" and ((.digest // \"\") | test(\"^sha256:[a-f0-9]{64}$\"))) then \"ready\" else \"incomplete\" end")"
+            case "$statuses" in
+              ready) echo "$tag is already published with a verified download."; exit 0 ;;
+              '') ;;
+              *) echo "$tag already exists with status $statuses. Review the existing release before retrying." >&2; exit 1 ;;
+            esac
+          fi
           printf 'version=%s\nasset=%s\n' "$v" "$asset" >> "$GITHUB_OUTPUT"
       - name: Verify Windows ZIP and build Apple Silicon DMG
         if: steps.source.outputs.version != ''
@@ -89,7 +97,7 @@ jobs:
           test -f "$app/Contents/Resources/game/east-island-native-preview.mjs"
           shasum -a 256 "dist/$ASSET"
       - name: Publish and verify Mac update
-        if: steps.source.outputs.version != ''
+        if: steps.source.outputs.version != '' && env.PUBLISH == 'true'
         env:
           VERSION: ${{ steps.source.outputs.version }}
           ASSET: ${{ steps.source.outputs.asset }}
